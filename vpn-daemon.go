@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -11,13 +12,14 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"os/user"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
-	"os/user"
-	"strconv"
 )
 
 const (
@@ -25,11 +27,13 @@ const (
 	MgmtSocket    = "/run/vpn-openvpn-mgmt.sock"
 	ConfigDir     = "/etc/vpn-manager/configs"
 	SecureTempDir = "/run/vpn-manager-temp"
+	InterfaceName = "tun0"
 )
 
 type VPNManager struct {
-	mu  sync.Mutex
-	cmd *exec.Cmd
+	mu   sync.Mutex
+	cmd  *exec.Cmd
+	done chan struct{}
 }
 
 type Request struct {
@@ -52,43 +56,33 @@ type VPNStatus struct {
 }
 
 func main() {
-	_ = os.Remove(SocketPath)
-	_ = os.Remove(MgmtSocket)
+	cleanupSockets()
 
-	// Verzeichnisse absichern (0700 = nur Root darf lesen/schreiben)
-	if err := os.MkdirAll(ConfigDir, 0700); err != nil {
-		log.Fatalf("Konfigurationsverzeichnis konnte nicht erstellt werden: %v", err)
+	// Verzeichnisse absichern
+	for _, dir := range []string{ConfigDir, SecureTempDir} {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			log.Fatalf("Verzeichnis konnte nicht erstellt werden (%s): %v", dir, err)
+		}
 	}
-	if err := os.MkdirAll(SecureTempDir, 0700); err != nil {
-		log.Fatalf("Temp-Verzeichnis konnte nicht erstellt werden: %v", err)
-	}
-
-	manager := &VPNManager{}
 
 	listener, err := net.Listen("unix", SocketPath)
 	if err != nil {
-		log.Fatal("Socket konnte nicht erstellt werden: ", err)
+		log.Fatalf("Socket konnte nicht erstellt werden: %v", err)
 	}
 	defer listener.Close()
 
-	// WICHTIG: 0660 nutzen! Du musst die Gruppe der Socket-Datei (z.B. per chown) 
-	// auf eine Gruppe setzen, in der dein GUI-User ist (z.B. "vpnusers").
-	_ = os.Chmod(SocketPath, 0660)
+	setupSocketPermissions()
 
-	if g, err := user.LookupGroup("vpnusers"); err == nil {
-    if gid, err := strconv.Atoi(g.Gid); err == nil {
-        _ = os.Chown(SocketPath, -1, gid) // -1 = User (root) beibehalten, Gruppe auf vpnusers ändern
-    }
-	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	manager := &VPNManager{}
+
 	go func() {
-		<-sigChan
+		<-ctx.Done()
 		log.Println("Daemon fährt herunter... Stoppe VPN.")
 		_ = manager.stopVPN()
-		_ = os.Remove(SocketPath)
-		_ = os.Remove(MgmtSocket)
+		cleanupSockets()
 		_ = os.RemoveAll(SecureTempDir)
 		os.Exit(0)
 	}()
@@ -98,18 +92,277 @@ func main() {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			continue
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				continue
+			}
 		}
 		go manager.handleConnection(conn)
 	}
 }
 
+// -----------------------------------------------------------------------------
+// OPENVPN PROZESS & PUSH_REPLY STREAM PARSER
+// -----------------------------------------------------------------------------
+
+func (m *VPNManager) startVPN(req Request) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.cmd != nil {
+		return errors.New("VPN läuft bereits")
+	}
+
+	configPath, err := resolveConfigPath(req.Config)
+	if err != nil {
+		return err
+	}
+
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		return fmt.Errorf("konfigurationsdatei existiert nicht: %s", filepath.Base(configPath))
+	}
+
+	args := []string{
+		"--config", configPath,
+		"--management", MgmtSocket, "unix",
+		"--auth-retry", "nointeract",
+		"--dev", InterfaceName,
+		"--verb", "3", // Verbosity 3 liefert den PUSH_REPLY String in Stdout
+	}
+
+	var authFile string
+	if req.Username != "" && req.Password != "" {
+		tmpFile, err := os.CreateTemp(SecureTempDir, "auth-*.txt")
+		if err != nil {
+			return fmt.Errorf("konnte temporäre Auth-Datei nicht erstellen: %w", err)
+		}
+		authFile = tmpFile.Name()
+
+		content := fmt.Sprintf("%s\n%s\n", req.Username, req.Password)
+		if _, err := tmpFile.WriteString(content); err != nil {
+			_ = tmpFile.Close()
+			_ = os.Remove(authFile)
+			return fmt.Errorf("konnte Anmeldedaten nicht schreiben: %w", err)
+		}
+		_ = tmpFile.Close()
+
+		args = append(args, "--auth-user-pass", authFile)
+	}
+
+	cmd := exec.Command("/usr/sbin/openvpn", args...)
+	
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		if authFile != "" {
+			_ = os.Remove(authFile)
+		}
+		return fmt.Errorf("stdout pipe konnte nicht erstellt werden: %w", err)
+	}
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Start(); err != nil {
+		if authFile != "" {
+			_ = os.Remove(authFile)
+		}
+		return fmt.Errorf("openvpn konnte nicht gestartet werden: %w", err)
+	}
+
+	m.cmd = cmd
+	m.done = make(chan struct{})
+
+// Überwachungs- & Log-Parsing Goroutine
+go func(c *exec.Cmd, aFile string, doneChan chan struct{}) {
+    scanner := bufio.NewScanner(stdout)
+    for scanner.Scan() {
+        line := scanner.Text()
+
+        // Routine-Management-Meldungen (Statusabfragen) ignorieren
+        if strings.Contains(line, "MANAGEMENT:") {
+            continue
+        }
+
+        // Alle verbleibenden OpenVPN-Logzeilen weiterleiten
+        log.Printf("[OpenVPN] %s", line)
+
+        // Parse den vom OpenVPN-Server gelieferten PUSH_REPLY
+        if strings.Contains(line, "PUSH_REPLY") {
+            dnsServers, domains := parsePushReply(line)
+            if len(dnsServers) > 0 {
+                log.Printf("Empfangene DNS-Server: %v, Domains: %v", dnsServers, domains)
+                applyDNS(InterfaceName, dnsServers, domains)
+            }
+        }
+    }
+
+		_ = c.Wait()
+
+		// DNS-Einstellungen und Interface beim Beenden zurücksetzen
+		revertDNS(InterfaceName)
+
+		if aFile != "" {
+			_ = os.Remove(aFile)
+		}
+		_ = os.Remove(MgmtSocket)
+
+		m.mu.Lock()
+		if m.cmd == c {
+			m.cmd = nil
+			close(doneChan)
+		}
+		m.mu.Unlock()
+	}(cmd, authFile, m.done)
+
+	return nil
+}
+
+func parsePushReply(line string) (dnsServers []string, domains []string) {
+	start := strings.Index(line, "PUSH_REPLY")
+	if start == -1 {
+		return
+	}
+
+	content := strings.TrimSuffix(line[start:], "'")
+	tokens := strings.Split(content, ",")
+
+	for _, token := range tokens {
+		fields := strings.Fields(strings.TrimSpace(token))
+		if len(fields) >= 3 && fields[0] == "dhcp-option" {
+			optType := strings.ToUpper(fields[1])
+			optVal := fields[2]
+			switch optType {
+			case "DNS", "DNS6":
+				dnsServers = append(dnsServers, optVal)
+			case "DOMAIN", "DOMAIN-SEARCH":
+				domains = append(domains, optVal)
+			}
+		}
+	}
+	return
+}
+
+// -----------------------------------------------------------------------------
+// DNS REGISTRIERUNG & RESET (REINES GO)
+// -----------------------------------------------------------------------------
+
+func applyDNS(iface string, dnsServers []string, domains []string) {
+	// 1. systemd-resolved (resolvectl)
+	if _, err := exec.LookPath("resolvectl"); err == nil {
+		cmdArgs := append([]string{"dns", iface}, dnsServers...)
+		if err := exec.Command("resolvectl", cmdArgs...).Run(); err != nil {
+			log.Printf("Fehler bei resolvectl dns: %v", err)
+		}
+
+		if len(domains) > 0 {
+			domArgs := append([]string{"domain", iface}, domains...)
+			_ = exec.Command("resolvectl", domArgs...).Run()
+		} else {
+			_ = exec.Command("resolvectl", "domain", iface, "~.").Run()
+		}
+		log.Printf("DNS via resolvectl erfolgreich gesetzt für %s", iface)
+		return
+	}
+
+	// 2. systemd-resolved (systemd-resolve)
+	if _, err := exec.LookPath("systemd-resolve"); err == nil {
+		args := []string{"--interface=" + iface}
+		for _, d := range dnsServers {
+			args = append(args, "--set-dns="+d)
+		}
+		if len(domains) > 0 {
+			for _, dom := range domains {
+				args = append(args, "--set-domain="+dom)
+			}
+		} else {
+			args = append(args, "--set-domain=~.")
+		}
+		_ = exec.Command("systemd-resolve", args...).Run()
+		log.Printf("DNS via systemd-resolve erfolgreich gesetzt für %s", iface)
+		return
+	}
+
+	// 3. Fallback: resolvconf
+	if _, err := exec.LookPath("resolvconf"); err == nil {
+		var input strings.Builder
+		for _, d := range dnsServers {
+			input.WriteString(fmt.Sprintf("nameserver %s\n", d))
+		}
+		for _, dom := range domains {
+			input.WriteString(fmt.Sprintf("search %s\n", dom))
+		}
+		cmd := exec.Command("resolvconf", "-a", iface)
+		cmd.Stdin = strings.NewReader(input.String())
+		_ = cmd.Run()
+		log.Printf("DNS via resolvconf erfolgreich gesetzt für %s", iface)
+		return
+	}
+}
+
+func revertDNS(iface string) {
+	if _, err := exec.LookPath("resolvectl"); err == nil {
+		_ = exec.Command("resolvectl", "revert", iface).Run()
+		log.Printf("DNS-Konfiguration für %s zurückgesetzt (resolvectl)", iface)
+	} else if _, err := exec.LookPath("systemd-resolve"); err == nil {
+		_ = exec.Command("systemd-resolve", "--interface="+iface, "--revert").Run()
+		log.Printf("DNS-Konfiguration für %s zurückgesetzt (systemd-resolve)", iface)
+	} else if _, err := exec.LookPath("resolvconf"); err == nil {
+		_ = exec.Command("resolvconf", "-d", iface).Run()
+		log.Printf("DNS-Konfiguration für %s zurückgesetzt (resolvconf)", iface)
+	}
+
+	// TUN-Schnittstelle explizit entfernen, um verbleibende Interfaces zu bereinigen
+	if err := exec.Command("ip", "link", "delete", iface).Run(); err == nil {
+		log.Printf("Schnittstelle %s wurde erfolgreich entfernt.", iface)
+	} else {
+		log.Printf("Hinweis: Schnittstelle %s konnte nicht gelöscht werden oder existierte nicht mehr.", iface)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// VERWALTUNGS- & SOCKET-LOGIK
+// -----------------------------------------------------------------------------
+
+func (m *VPNManager) stopVPN() error {
+	m.mu.Lock()
+	if m.cmd == nil || m.cmd.Process == nil {
+		m.mu.Unlock()
+		return errors.New("VPN läuft nicht")
+	}
+
+	proc := m.cmd.Process
+	done := m.done
+	m.mu.Unlock()
+
+	conn, err := net.DialTimeout("unix", MgmtSocket, 1*time.Second)
+	if err == nil {
+		_ = conn.SetDeadline(time.Now().Add(1 * time.Second))
+		_, _ = fmt.Fprintf(conn, "signal SIGTERM\nquit\n")
+		_ = conn.Close()
+	} else {
+		_ = proc.Signal(syscall.SIGTERM)
+	}
+
+	select {
+	case <-done:
+		return nil
+	case <-time.After(3 * time.Second):
+		m.mu.Lock()
+		if m.cmd != nil && m.cmd.Process != nil {
+			_ = m.cmd.Process.Kill()
+		}
+		m.mu.Unlock()
+		return nil
+	}
+}
+
 func (m *VPNManager) handleConnection(conn net.Conn) {
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 
 	var req Request
 	if err := json.NewDecoder(conn).Decode(&req); err != nil {
+		sendResponse(conn, fmt.Errorf("ungültiger Request: %w", err), "", nil)
 		return
 	}
 
@@ -143,179 +396,101 @@ func (m *VPNManager) handleConnection(conn net.Conn) {
 	}
 }
 
-func (m *VPNManager) startVPN(req Request) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if m.cmd != nil {
-		return errors.New("VPN läuft bereits")
+func (m *VPNManager) getVPNStatus() (VPNStatus, error) {
+	conn, err := net.DialTimeout("unix", MgmtSocket, 1*time.Second)
+	if err != nil {
+		return VPNStatus{State: "DISCONNECTED"}, nil
 	}
+	defer conn.Close()
 
-	safeFileName := filepath.Base(req.Config)
-	configPath := filepath.Join(ConfigDir, safeFileName)
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	scanner := bufio.NewScanner(conn)
 
-	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		return fmt.Errorf("konfigurationsdatei %s existiert nicht", safeFileName)
-	}
-
-	args := []string{
-		"--config", configPath,
-		"--management", MgmtSocket, "unix", // Sicherer Unix-Socket für Management
-		"--auth-retry", "nointeract",
-		"--dev", "tun0",
-	}
-
-	var authFile string
-	if req.Username != "" && req.Password != "" {
-		// Sicherer File-Erstellung statt hardcoded /tmp
-		tmpFile, err := os.CreateTemp(SecureTempDir, "auth-*.txt")
-		if err != nil {
-			return fmt.Errorf("konnte temporäre auth-Datei nicht erstellen: %w", err)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, ">INFO:") {
+			break
 		}
-		authFile = tmpFile.Name()
-
-		content := fmt.Sprintf("%s\n%s", req.Username, req.Password)
-		if _, err := tmpFile.WriteString(content); err != nil {
-			_ = tmpFile.Close()
-			_ = os.Remove(authFile)
-			return err
-		}
-		_ = tmpFile.Close()
-		args = append(args, "--auth-user-pass", authFile)
 	}
 
-	cmd := exec.Command("/usr/sbin/openvpn", args...)
-	
-	cmd.Stdout = os.Stdout 
-  cmd.Stderr = os.Stderr
-	
-	if err := cmd.Start(); err != nil {
-		if authFile != "" {
-			_ = os.Remove(authFile)
+	if _, err := fmt.Fprintf(conn, "state\n"); err != nil {
+		return VPNStatus{State: "UNKNOWN"}, err
+	}
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+
+		if strings.HasPrefix(line, ">") || line == "" || line == "END" || strings.HasPrefix(line, "SUCCESS:") {
+			continue
 		}
+
+		parts := strings.Split(line, ",")
+		if len(parts) >= 2 {
+			status := VPNStatus{
+				State: strings.TrimSpace(parts[1]),
+			}
+
+			if len(parts) >= 4 {
+				status.LocalIP = strings.TrimSpace(parts[3])
+			}
+
+			return status, nil
+		}
+	}
+
+	return VPNStatus{State: "WAITING"}, nil
+}
+
+func handleImport(req Request) error {
+	configPath, err := resolveConfigPath(req.Config)
+	if err != nil {
 		return err
 	}
 
-	m.cmd = cmd
+	content, err := base64.StdEncoding.DecodeString(req.Content)
+	if err != nil {
+		return fmt.Errorf("base64 Dekodierung fehlgeschlagen: %w", err)
+	}
 
-	go func(c *exec.Cmd, aFile string) {
-		_ = c.Wait()
-		if aFile != "" {
-			_ = os.Remove(aFile)
-		}
-		_ = os.Remove(MgmtSocket)
+	if err := os.WriteFile(configPath, content, 0600); err != nil {
+		return fmt.Errorf("datei konnte nicht geschrieben werden: %w", err)
+	}
 
-		m.mu.Lock()
-		if m.cmd == c {
-			m.cmd = nil
-		}
-		m.mu.Unlock()
-	}(cmd, authFile)
-
+	log.Printf("Erfolgreich importiert: %s", configPath)
 	return nil
 }
 
-func (m *VPNManager) stopVPN() error {
-  m.mu.Lock()
-  
-  if m.cmd == nil || m.cmd.Process == nil {
-    m.mu.Unlock()
-    return errors.New("VPN läuft nicht")
-  }
-  
-  proc := m.cmd.Process
-  m.mu.Unlock() 
+func handleList() ([]string, error) {
+	files, err := os.ReadDir(ConfigDir)
+	if err != nil {
+		return nil, fmt.Errorf("konnte Verzeichnis nicht lesen: %w", err)
+	}
 
-  stopped := false
-
-  // Versuch: Sauberes Beenden via Management-Socket
-  conn, err := net.DialTimeout("unix", MgmtSocket, 1*time.Second)
-  if err == nil {
-    _ = conn.SetDeadline(time.Now().Add(1 * time.Second))
-    if _, err := fmt.Fprintf(conn, "signal SIGTERM\nquit\n"); err == nil {
-      stopped = true
-    }
-    _ = conn.Close()
-  }
-
-  // Fallback: Wenn Socket nicht erreichbar war oder fehlschlug -> direktes Linux-Signal
-  if !stopped {
-    _ = proc.Signal(syscall.SIGTERM)
-  }
-
-  // WICHTIG: Gib OpenVPN kurz Zeit (bis zu 3 Sekunden), um tun0 sauber abzubauen!
-  // Wir prüfen im 200ms-Takt, ob die startVPN-Goroutine m.cmd auf nil gesetzt hat.
-  for i := 0; i < 15; i++ {
-    time.Sleep(200 * time.Millisecond)
-    m.mu.Lock()
-    running := (m.cmd != nil)
-    m.mu.Unlock()
-    
-    if !running {
-      // Perfekt, OpenVPN hat sich beendet und die Goroutine hat aufgeräumt!
-      return nil
-    }
-  }
-
-  // Wenn nach 3 Sekunden immer noch nicht beendet -> Harter Kill (SIGKILL)
-  m.mu.Lock()
-  if m.cmd != nil && m.cmd.Process != nil {
-    _ = m.cmd.Process.Kill()
-    m.cmd = nil
-  }
-  m.mu.Unlock()
-
-  return nil
+	var configFiles []string
+	for _, file := range files {
+		if !file.IsDir() && strings.HasSuffix(file.Name(), ".ovpn") {
+			configFiles = append(configFiles, file.Name())
+		}
+	}
+	return configFiles, nil
 }
 
-func (m *VPNManager) getVPNStatus() (VPNStatus, error) {
-  conn, err := net.DialTimeout("unix", MgmtSocket, 1*time.Second)
-  if err != nil {
-    return VPNStatus{State: "DISCONNECTED"}, nil
-  }
-  defer conn.Close()
+func handleDelete(req Request) error {
+	configPath, err := resolveConfigPath(req.Config)
+	if err != nil {
+		return err
+	}
 
-  _ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		return fmt.Errorf("datei existiert nicht: %s", filepath.Base(configPath))
+	}
 
-  if _, err := fmt.Fprintf(conn, "state\n"); err != nil {
-    return VPNStatus{State: "UNKNOWN"}, err
-  }
+	if err := os.Remove(configPath); err != nil {
+		return fmt.Errorf("konnte Datei nicht löschen: %w", err)
+	}
 
-  scanner := bufio.NewScanner(conn)
-  for scanner.Scan() {
-    line := strings.TrimSpace(scanner.Text())
-    
-    // DEBUG: Das zeigt uns im Terminal EXAKT, was OpenVPN antwortet!
-    //fmt.Printf("DEBUG OpenVPN-State: '%s'\n", line)
-
-    // Unnötige Zeilen (Banner, END, etc.) ignorieren
-    if strings.HasPrefix(line, ">") || line == "" || line == "END" || strings.HasPrefix(line, "SUCCESS:") {
-      continue
-    }
-
-    parts := strings.Split(line, ",")
-    
-    // Wir akzeptieren schon ab 2 Feldern (z.B. für CONNECTING, AUTH, etc.)
-    if len(parts) >= 2 {
-      status := VPNStatus{
-        State: strings.TrimSpace(parts[1]),
-      }
-      
-      // Die IP-Adresse vergeben wir nur, wenn sie auch wirklich mitgeliefert wurde
-      if len(parts) >= 4 {
-        status.LocalIP = strings.TrimSpace(parts[3])
-      }
-      
-      return status, nil
-    }
-  }
-
-  // Falls der Scanner durch einen Fehler abbrach
-  if err := scanner.Err(); err != nil {
-    fmt.Printf("DEBUG Scanner-Error: %v\n", err)
-  }
-
-  return VPNStatus{State: "WAITING"}, nil
+	log.Printf("Erfolgreich gelöscht: %s", configPath)
+	return nil
 }
 
 func sendResponse(conn net.Conn, err error, successMsg string, data any) {
@@ -332,78 +507,39 @@ func sendResponse(conn net.Conn, err error, successMsg string, data any) {
 	_ = json.NewEncoder(conn).Encode(resp)
 }
 
-func handleImport(req Request) error {
-	safeFileName := filepath.Base(req.Config)
-
-	safeFileName = sanitizeFileName(safeFileName)
-
-	if !strings.HasSuffix(safeFileName, ".ovpn") {
-		return errors.New("ungültiges Dateiformat (muss .ovpn sein)")
+func resolveConfigPath(rawFilename string) (string, error) {
+	cleanName := sanitizeFileName(filepath.Base(rawFilename))
+	if !strings.HasSuffix(cleanName, ".ovpn") {
+		return "", errors.New("ungültiges Dateiformat (muss auf .ovpn enden)")
 	}
-
-	targetPath := filepath.Join(ConfigDir, safeFileName)
-	content, err := base64.StdEncoding.DecodeString(req.Content)
-	if err != nil {
-		return fmt.Errorf("base64 Dekodierung fehlgeschlagen: %w", err)
-	}
-
-	if err := os.WriteFile(targetPath, content, 0600); err != nil {
-		return fmt.Errorf("Datei konnte nicht geschrieben werden: %w", err)
-	}
-
-	log.Printf("Erfolgreich importiert: %s", targetPath)
-	return nil
+	return filepath.Join(ConfigDir, cleanName), nil
 }
 
-func handleList() ([]string, error) {
-	files, err := os.ReadDir(ConfigDir)
-	if err != nil {
-		return nil, err
+var multiUnderscoreRegex = regexp.MustCompile(`_+`)
+var invalidCharsRegex = regexp.MustCompile(`[^\w\.\-]`)
+
+func sanitizeFileName(filename string) string {
+	clean := strings.ReplaceAll(filename, " ", "_")
+	clean = invalidCharsRegex.ReplaceAllString(clean, "")
+	clean = multiUnderscoreRegex.ReplaceAllString(clean, "_")
+	return clean
+}
+
+func cleanupSockets() {
+	_ = os.Remove(SocketPath)
+	_ = os.Remove(MgmtSocket)
+}
+
+func setupSocketPermissions() {
+	if err := os.Chmod(SocketPath, 0660); err != nil {
+		log.Printf("Warnung: Socket Chmod fehlgeschlagen: %v", err)
 	}
 
-	var configFiles []string
-	for _, file := range files {
-		if !file.IsDir() && strings.HasSuffix(file.Name(), ".ovpn") {
-			configFiles = append(configFiles, file.Name())
+	if g, err := user.LookupGroup("vpnusers"); err == nil {
+		if gid, err := strconv.Atoi(g.Gid); err == nil {
+			if err := os.Chown(SocketPath, -1, gid); err != nil {
+				log.Printf("Warnung: Socket Chown auf vpnusers fehlgeschlagen: %v", err)
+			}
 		}
 	}
-	return configFiles, nil
-}
-
-func handleDelete(req Request) error {
-	safeFileName := filepath.Base(req.Config)
-	if !strings.HasSuffix(safeFileName, ".ovpn") {
-		return errors.New("ungültiges Dateiformat")
-	}
-
-	targetPath := filepath.Join(ConfigDir, safeFileName)
-	if _, err := os.Stat(targetPath); os.IsNotExist(err) {
-		return fmt.Errorf("datei %s existiert nicht", safeFileName)
-	}
-
-	if err := os.Remove(targetPath); err != nil {
-		return fmt.Errorf("konnte datei nicht löschen: %w", err)
-	}
-
-	log.Printf("Erfolgreich gelöscht: %s", targetPath)
-	return nil
-}
-
-// Diese Funktion bereinigt Dateinamen für Linux
-func sanitizeFileName(filename string) string {
-    // Ersetze Leerzeichen durch Unterstriche
-    clean := strings.ReplaceAll(filename, " ", "_")
-    
-    // Entferne problematische Sonderzeichen wie Klammern
-    clean = strings.ReplaceAll(clean, "(", "")
-    clean = strings.ReplaceAll(clean, ")", "")
-    clean = strings.ReplaceAll(clean, "'", "")
-    clean = strings.ReplaceAll(clean, "\"", "")
-    
-    // Verhindere doppelte Unterstriche (z.B. aus " (_" -> "__" -> "_")
-    for strings.Contains(clean, "__") {
-        clean = strings.ReplaceAll(clean, "__", "_")
-    }
-    
-    return clean
 }

@@ -49,22 +49,20 @@ type VPNStatus struct {
 var assets embed.FS
 
 type AppUI struct {
-	app                fyne.App
-	window             fyne.Window
-	trayApp            desktop.App
-	trayMenu           *fyne.Menu
-	disconnectItem     *fyne.MenuItem
-	startBtn           *widget.Button
-	stopBtn            *widget.Button
-	userEntry          *widget.Entry
-	passEntry          *widget.Entry
-	configSelect       *widget.Select
-	statusData         binding.String
-	ipData             binding.String
-	connectedBinding   binding.Bool
-	refreshTriggerData binding.Bool
-	globalConfigs      []string
-	selectedConfig     string
+	app              fyne.App
+	window           fyne.Window
+	trayApp          desktop.App
+	trayMenu         *fyne.Menu
+	disconnectItem   *fyne.MenuItem
+	startBtn         *widget.Button
+	stopBtn          *widget.Button
+	userEntry        *widget.Entry
+	passEntry        *widget.Entry
+	configSelect     *widget.Select
+	statusData       binding.String
+	ipData           binding.String
+	connectedBinding binding.Bool
+	selectedConfig   string
 
 	iconRed    fyne.Resource
 	iconYellow fyne.Resource
@@ -92,15 +90,14 @@ func main() {
 func newAppUI() *AppUI {
 	myApp := app.NewWithID("com.vpnmanager.client")
 	win := myApp.NewWindow("VPN Manager")
-	win.Resize(fyne.NewSize(380, 260))
+	win.Resize(fyne.NewSize(380, 280))
 
 	ui := &AppUI{
-		app:                myApp,
-		window:             win,
-		statusData:         binding.NewString(),
-		ipData:             binding.NewString(),
-		connectedBinding:   binding.NewBool(),
-		refreshTriggerData: binding.NewBool(),
+		app:              myApp,
+		window:           win,
+		statusData:       binding.NewString(),
+		ipData:           binding.NewString(),
+		connectedBinding: binding.NewBool(),
 	}
 
 	ui.iconRed = ui.loadIcon("red")
@@ -126,123 +123,29 @@ func (ui *AppUI) buildUI() {
 	statusLabel := widget.NewLabelWithData(ui.statusData)
 	ipLabel := widget.NewLabelWithData(ui.ipData)
 
+	ui.configSelect = widget.NewSelect([]string{}, func(selected string) {
+		ui.selectedConfig = selected
+	})
+
 	ui.userEntry = widget.NewEntry()
 	ui.userEntry.SetPlaceHolder("Benutzername")
+	// Enter-Taste im Benutzer-Feld wechselt ins Passwort-Feld
+	ui.userEntry.OnSubmitted = func(_ string) {
+		ui.window.Canvas().Focus(ui.passEntry)
+	}
 
 	ui.passEntry = widget.NewPasswordEntry()
 	ui.passEntry.SetPlaceHolder("Passwort")
+	// Enter-Taste im Passwort-Feld startet die Verbindung
+	ui.passEntry.OnSubmitted = func(_ string) {
+		ui.handleStart()
+	}
 
-	ui.configSelect = widget.NewSelect([]string{}, func(selected string) {
-		ui.selectedConfig = selected // Sende nur den Dateinamen zum Daemon!
-	})
+	importBtn := widget.NewButton("Config Importieren", ui.handleImport)
+	deleteBtn := widget.NewButton("Config löschen", ui.handleDelete)
 
-	importBtn := widget.NewButton("Config Importieren", func() {
-		fileDialog := dialog.NewFileOpen(func(reader fyne.URIReadCloser, err error) {
-			if err != nil {
-				ui.showError(err)
-				return
-			}
-			if reader == nil {
-				return // Abbruch durch User
-			}
-			defer reader.Close()
-
-			content, err := io.ReadAll(reader)
-			if err != nil {
-				ui.showError(errors.New("konnte Datei nicht lesen: " + err.Error()))
-				return
-			}
-
-			encodedContent := base64.StdEncoding.EncodeToString(content)
-			req := Request{
-				Action:  "import",
-				Config:  reader.URI().Name(),
-				Content: encodedContent,
-			}
-
-			go func() {
-				if _, err := sendCommand(req); err != nil {
-					ui.showError(err)
-					return
-				}
-				ui.refreshConfigList()
-				// KORRIGIERT: Fynes offizielle Funktion für UI-Updates aus Goroutines
-				fyne.Do(func() {
-					dialog.ShowInformation("Erfolg", "Datei "+req.Config+" importiert.", ui.window)
-				})
-			}()
-		}, ui.window)
-
-    fileDialog.Resize(fyne.NewSize(700, 500))
-		fileDialog.SetFilter(storage.NewExtensionFileFilter([]string{".ovpn"}))
-		fileDialog.Show()
-	})
-
-	deleteBtn := widget.NewButton("Config löschen", func() {
-		if ui.configSelect.Selected == "" {
-			dialog.ShowError(errors.New("bitte wähle zuerst eine Konfiguration aus"), ui.window)
-			return
-		}
-
-		dialog.ShowConfirm("Konfiguration löschen",
-			fmt.Sprintf("Möchtest du die Datei \"%s\" wirklich löschen?", ui.configSelect.Selected),
-			func(confirmed bool) {
-				if confirmed {
-					req := Request{Action: "delete", Config: ui.configSelect.Selected}
-					go func() {
-						if _, err := sendCommand(req); err != nil {
-							ui.showError(err)
-							return
-						}
-						// KORRIGIERT: fyne.Do statt QueueEvent
-						fyne.Do(func() {
-							ui.configSelect.ClearSelected()
-							ui.selectedConfig = ""
-							dialog.ShowInformation("Erfolg", "Konfiguration gelöscht.", ui.window)
-						})
-						ui.refreshConfigList()
-					}()
-				}
-			}, ui.window)
-	})
-
-	ui.startBtn = widget.NewButton("  Verbinden  ", func() {
-		if ui.selectedConfig == "" {
-			dialog.ShowError(errors.New("bitte wähle eine Config-Datei aus"), ui.window)
-			return
-		}
-		if ui.userEntry.Text == "" || ui.passEntry.Text == "" {
-			dialog.ShowError(errors.New("benutzername und Passwort sind erforderlich"), ui.window)
-			return
-		}
-
-		req := Request{
-			Action:   "start",
-			Config:   ui.selectedConfig,
-			Username: ui.userEntry.Text,
-			Password: ui.passEntry.Text,
-		}
-
-		go func() {
-			if _, err := sendCommand(req); err != nil {
-				ui.showError(err)
-				return
-			}
-			// KORRIGIERT: fyne.Do statt QueueEvent
-			fyne.Do(func() { ui.setUIState(true) })
-		}()
-	})
-
-	ui.stopBtn = widget.NewButton("  Trennen  ", func() {
-		go func() {
-			if _, err := sendCommand(Request{Action: "stop"}); err != nil {
-				ui.showError(err)
-				return
-			}
-			// KORRIGIERT: fyne.Do statt QueueEvent
-			fyne.Do(func() { ui.setUIState(false) })
-		}()
-	})
+	ui.startBtn = widget.NewButton("  Verbinden  ", ui.handleStart)
+	ui.stopBtn = widget.NewButton("  Trennen  ", ui.handleStop)
 
 	ui.connectedBinding.AddListener(binding.NewDataListener(func() {
 		if val, _ := ui.connectedBinding.Get(); val {
@@ -250,42 +153,145 @@ func (ui *AppUI) buildUI() {
 		}
 	}))
 
-	ui.refreshTriggerData.AddListener(binding.NewDataListener(func() {
-		ui.configSelect.Options = ui.globalConfigs
-		ui.configSelect.Refresh()
-	}))
-
 	ui.setUIState(false)
 
 	spacer := layout.NewSpacer()
 	importBtns := container.NewHBox(importBtn, spacer, deleteBtn)
 	startBtns := container.NewHBox(ui.startBtn, spacer, ui.stopBtn)
+
+	// Anordnung optimiert für die TAB-Fokus-Reihenfolge (Top-Down)
 	content := container.NewVBox(
 		ui.configSelect,
-		importBtns,
-		statusLabel,
-		ipLabel,
 		ui.userEntry,
 		ui.passEntry,
 		startBtns,
+		statusLabel,
+		ipLabel,
+		importBtns,
 	)
 
 	ui.window.SetContent(content)
 	ui.window.SetCloseIntercept(func() { ui.window.Hide() })
 }
 
+// -----------------------------------------------------------------------------
+// BUTTON HANDLER & ACTIONS
+// -----------------------------------------------------------------------------
+
+func (ui *AppUI) handleImport() {
+	fileDialog := dialog.NewFileOpen(func(reader fyne.URIReadCloser, err error) {
+		if err != nil {
+			ui.showError(err)
+			return
+		}
+		if reader == nil {
+			return
+		}
+		defer reader.Close()
+
+		content, err := io.ReadAll(reader)
+		if err != nil {
+			ui.showError(fmt.Errorf("konnte Datei nicht lesen: %w", err))
+			return
+		}
+
+		encodedContent := base64.StdEncoding.EncodeToString(content)
+		req := Request{
+			Action:  "import",
+			Config:  reader.URI().Name(),
+			Content: encodedContent,
+		}
+
+		go func() {
+			if _, err := sendCommand(req); err != nil {
+				ui.showError(err)
+				return
+			}
+			ui.refreshConfigList()
+			fyne.Do(func() {
+				dialog.ShowInformation("Erfolg", "Datei "+req.Config+" importiert.", ui.window)
+			})
+		}()
+	}, ui.window)
+
+	fileDialog.Resize(fyne.NewSize(700, 500))
+	fileDialog.SetFilter(storage.NewExtensionFileFilter([]string{".ovpn"}))
+	fileDialog.Show()
+}
+
+func (ui *AppUI) handleDelete() {
+	if ui.configSelect.Selected == "" {
+		dialog.ShowError(errors.New("bitte wähle zuerst eine Konfiguration aus"), ui.window)
+		return
+	}
+
+	dialog.ShowConfirm("Konfiguration löschen",
+		fmt.Sprintf("Möchtest du die Datei \"%s\" wirklich löschen?", ui.configSelect.Selected),
+		func(confirmed bool) {
+			if !confirmed {
+				return
+			}
+			req := Request{Action: "delete", Config: ui.configSelect.Selected}
+			go func() {
+				if _, err := sendCommand(req); err != nil {
+					ui.showError(err)
+					return
+				}
+				fyne.Do(func() {
+					ui.configSelect.ClearSelected()
+					ui.selectedConfig = ""
+					dialog.ShowInformation("Erfolg", "Konfiguration gelöscht.", ui.window)
+				})
+				ui.refreshConfigList()
+			}()
+		}, ui.window)
+}
+
+func (ui *AppUI) handleStart() {
+	if ui.selectedConfig == "" {
+		dialog.ShowError(errors.New("bitte wähle eine Config-Datei aus"), ui.window)
+		return
+	}
+	if ui.userEntry.Text == "" || ui.passEntry.Text == "" {
+		dialog.ShowError(errors.New("benutzername und Passwort sind erforderlich"), ui.window)
+		return
+	}
+
+	req := Request{
+		Action:   "start",
+		Config:   ui.selectedConfig,
+		Username: ui.userEntry.Text,
+		Password: ui.passEntry.Text,
+	}
+
+	go func() {
+		if _, err := sendCommand(req); err != nil {
+			ui.showError(err)
+			return
+		}
+		fyne.Do(func() { ui.setUIState(true) })
+	}()
+}
+
+func (ui *AppUI) handleStop() {
+	go func() {
+		if _, err := sendCommand(Request{Action: "stop"}); err != nil {
+			ui.showError(err)
+			return
+		}
+		fyne.Do(func() { ui.setUIState(false) })
+	}()
+}
+
+// -----------------------------------------------------------------------------
+// TRAY & STATUS LOOP
+// -----------------------------------------------------------------------------
+
 func (ui *AppUI) setupTray() {
 	if desk, ok := ui.app.(desktop.App); ok {
 		ui.trayApp = desk
 
-		ui.disconnectItem = fyne.NewMenuItem("Trennen", func() {
-			go func() {
-				if _, err := sendCommand(Request{Action: "stop"}); err == nil {
-					// KORRIGIERT: fyne.Do statt QueueEvent
-					fyne.Do(func() { ui.setUIState(false) })
-				}
-			}()
-		})
+		ui.disconnectItem = fyne.NewMenuItem("Trennen", ui.handleStop)
 		ui.disconnectItem.Disabled = true
 
 		ui.trayMenu = fyne.NewMenu("VPN Manager",
@@ -352,9 +358,10 @@ func (ui *AppUI) refreshConfigList() {
 		return
 	}
 
-	ui.globalConfigs = configs
-	current, _ := ui.refreshTriggerData.Get()
-	_ = ui.refreshTriggerData.Set(!current)
+	fyne.Do(func() {
+		ui.configSelect.Options = configs
+		ui.configSelect.Refresh()
+	})
 }
 
 func (ui *AppUI) setUIState(connected bool) {
@@ -364,7 +371,6 @@ func (ui *AppUI) setUIState(connected bool) {
 		ui.userEntry.Disable()
 		ui.passEntry.Disable()
 		ui.passEntry.SetText("")
-		ui.passEntry.Password = false
 		ui.configSelect.Disable()
 		if ui.disconnectItem != nil {
 			ui.disconnectItem.Disabled = false
@@ -375,8 +381,10 @@ func (ui *AppUI) setUIState(connected bool) {
 		ui.userEntry.SetText("")
 		ui.userEntry.Enable()
 		ui.passEntry.Enable()
-		ui.passEntry.Password = true
 		ui.configSelect.Enable()
+		if ui.disconnectItem != nil {
+			ui.disconnectItem.Disabled = true
+		}
 	}
 	ui.passEntry.Refresh()
 	if ui.trayApp != nil && ui.trayMenu != nil {
@@ -385,11 +393,14 @@ func (ui *AppUI) setUIState(connected bool) {
 }
 
 func (ui *AppUI) showError(err error) {
-	// KORRIGIERT: fyne.Do statt QueueEvent
 	fyne.Do(func() {
 		dialog.ShowError(err, ui.window)
 	})
 }
+
+// -----------------------------------------------------------------------------
+// IPC CLIENT (UNIX SOCKET)
+// -----------------------------------------------------------------------------
 
 func sendCommand(req Request) (json.RawMessage, error) {
 	conn, err := net.DialTimeout("unix", SocketPath, 3*time.Second)
