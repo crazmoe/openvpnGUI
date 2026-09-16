@@ -73,7 +73,6 @@ func main() {
 func newAppUI() *AppUI {
 	myApp := app.NewWithID("com.vpnmanager.client")
 	win := myApp.NewWindow("VPN Manager")
-	win.Resize(fyne.NewSize(420, 340))
 
 	ui := &AppUI{
 		app:              myApp,
