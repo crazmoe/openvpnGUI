@@ -22,28 +22,9 @@ import (
 	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+
+	"openvpnGUI/internal/ipc"
 )
-
-const SocketPath = "/run/vpn-manager.sock"
-
-type DaemonResponse struct {
-	Status  string          `json:"status"`
-	Message string          `json:"message"`
-	Data    json.RawMessage `json:"data,omitempty"`
-}
-
-type Request struct {
-	Action   string `json:"action"`
-	Config   string `json:"config"`
-	Username string `json:"username"`
-	Password string `json:"password"`
-	Content  string `json:"content"`
-}
-
-type VPNStatus struct {
-	State   string `json:"state"`
-	LocalIP string `json:"local_ip"`
-}
 
 //go:embed assets/*.png
 var assets embed.FS
@@ -51,6 +32,7 @@ var assets embed.FS
 type AppUI struct {
 	app              fyne.App
 	window           fyne.Window
+	prefs            fyne.Preferences
 	trayApp          desktop.App
 	trayMenu         *fyne.Menu
 	disconnectItem   *fyne.MenuItem
@@ -67,6 +49,7 @@ type AppUI struct {
 	iconRed    fyne.Resource
 	iconYellow fyne.Resource
 	iconGreen  fyne.Resource
+	iconAppBig fyne.Resource
 }
 
 func main() {
@@ -90,11 +73,12 @@ func main() {
 func newAppUI() *AppUI {
 	myApp := app.NewWithID("com.vpnmanager.client")
 	win := myApp.NewWindow("VPN Manager")
-	win.Resize(fyne.NewSize(380, 280))
+	win.Resize(fyne.NewSize(420, 340))
 
 	ui := &AppUI{
 		app:              myApp,
 		window:           win,
+		prefs:            myApp.Preferences(),
 		statusData:       binding.NewString(),
 		ipData:           binding.NewString(),
 		connectedBinding: binding.NewBool(),
@@ -103,6 +87,12 @@ func newAppUI() *AppUI {
 	ui.iconRed = ui.loadIcon("red")
 	ui.iconYellow = ui.loadIcon("yellow")
 	ui.iconGreen = ui.loadIcon("green")
+	ui.iconAppBig = ui.loadIcon("red64")
+
+	// App-/Fenster-Icon bleibt statisch; der Verbindungsstatus wird
+	// ausschließlich über das Tray-Icon signalisiert.
+	myApp.SetIcon(ui.iconAppBig)
+	win.SetIcon(ui.iconAppBig)
 
 	return ui
 }
@@ -125,10 +115,13 @@ func (ui *AppUI) buildUI() {
 
 	ui.configSelect = widget.NewSelect([]string{}, func(selected string) {
 		ui.selectedConfig = selected
+		ui.prefs.SetString("lastConfig", selected)
 	})
+	ui.configSelect.PlaceHolder = "Bitte wählen..."
 
 	ui.userEntry = widget.NewEntry()
 	ui.userEntry.SetPlaceHolder("Benutzername")
+	ui.userEntry.SetText(ui.prefs.String("lastUsername"))
 	// Enter-Taste im Benutzer-Feld wechselt ins Passwort-Feld
 	ui.userEntry.OnSubmitted = func(_ string) {
 		ui.window.Canvas().Focus(ui.passEntry)
@@ -141,11 +134,12 @@ func (ui *AppUI) buildUI() {
 		ui.handleStart()
 	}
 
-	importBtn := widget.NewButton("Config Importieren", ui.handleImport)
-	deleteBtn := widget.NewButton("Config löschen", ui.handleDelete)
+	importBtn := widget.NewButtonWithIcon("Importieren", theme.FolderOpenIcon(), ui.handleImport)
+	deleteBtn := widget.NewButtonWithIcon("Löschen", theme.DeleteIcon(), ui.handleDelete)
 
-	ui.startBtn = widget.NewButton("  Verbinden  ", ui.handleStart)
-	ui.stopBtn = widget.NewButton("  Trennen  ", ui.handleStop)
+	ui.startBtn = widget.NewButtonWithIcon("Verbinden", theme.MediaPlayIcon(), ui.handleStart)
+	ui.startBtn.Importance = widget.HighImportance
+	ui.stopBtn = widget.NewButtonWithIcon("Trennen", theme.MediaStopIcon(), ui.handleStop)
 
 	ui.connectedBinding.AddListener(binding.NewDataListener(func() {
 		if val, _ := ui.connectedBinding.Get(); val {
@@ -155,22 +149,27 @@ func (ui *AppUI) buildUI() {
 
 	ui.setUIState(false)
 
+	form := widget.NewForm(
+		widget.NewFormItem("Server", ui.configSelect),
+		widget.NewFormItem("Benutzername", ui.userEntry),
+		widget.NewFormItem("Passwort", ui.passEntry),
+	)
+
 	spacer := layout.NewSpacer()
 	importBtns := container.NewHBox(importBtn, spacer, deleteBtn)
 	startBtns := container.NewHBox(ui.startBtn, spacer, ui.stopBtn)
+	statusRow := container.NewHBox(statusLabel, layout.NewSpacer(), ipLabel)
 
 	// Anordnung optimiert für die TAB-Fokus-Reihenfolge (Top-Down)
 	content := container.NewVBox(
-		ui.configSelect,
-		ui.userEntry,
-		ui.passEntry,
+		form,
 		startBtns,
-		statusLabel,
-		ipLabel,
+		widget.NewSeparator(),
+		statusRow,
 		importBtns,
 	)
 
-	ui.window.SetContent(content)
+	ui.window.SetContent(container.NewPadded(content))
 	ui.window.SetCloseIntercept(func() { ui.window.Hide() })
 }
 
@@ -196,7 +195,7 @@ func (ui *AppUI) handleImport() {
 		}
 
 		encodedContent := base64.StdEncoding.EncodeToString(content)
-		req := Request{
+		req := ipc.Request{
 			Action:  "import",
 			Config:  reader.URI().Name(),
 			Content: encodedContent,
@@ -231,7 +230,7 @@ func (ui *AppUI) handleDelete() {
 			if !confirmed {
 				return
 			}
-			req := Request{Action: "delete", Config: ui.configSelect.Selected}
+			req := ipc.Request{Action: "delete", Config: ui.configSelect.Selected}
 			go func() {
 				if _, err := sendCommand(req); err != nil {
 					ui.showError(err)
@@ -257,26 +256,38 @@ func (ui *AppUI) handleStart() {
 		return
 	}
 
-	req := Request{
+	req := ipc.Request{
 		Action:   "start",
 		Config:   ui.selectedConfig,
 		Username: ui.userEntry.Text,
 		Password: ui.passEntry.Text,
 	}
 
+	// Sofortiges Feedback, damit der Nutzer nicht mehrfach klickt während
+	// auf die Antwort des Daemons gewartet wird.
+	ui.startBtn.Disable()
+	_ = ui.statusData.Set("Status: Verbinde...")
+	if ui.trayApp != nil {
+		ui.trayApp.SetSystemTrayIcon(ui.iconYellow)
+	}
+
 	go func() {
 		if _, err := sendCommand(req); err != nil {
 			ui.showError(err)
+			fyne.Do(func() { ui.setUIState(false) })
 			return
 		}
+		ui.prefs.SetString("lastUsername", req.Username)
 		fyne.Do(func() { ui.setUIState(true) })
 	}()
 }
 
 func (ui *AppUI) handleStop() {
+	ui.stopBtn.Disable()
 	go func() {
-		if _, err := sendCommand(Request{Action: "stop"}); err != nil {
+		if _, err := sendCommand(ipc.Request{Action: "stop"}); err != nil {
 			ui.showError(err)
+			fyne.Do(func() { ui.stopBtn.Enable() })
 			return
 		}
 		fyne.Do(func() { ui.setUIState(false) })
@@ -304,6 +315,44 @@ func (ui *AppUI) setupTray() {
 	}
 }
 
+// stateCategory ordnet einen rohen OpenVPN-Status einer von drei
+// UI-Kategorien zu, die Icon-Farbe und Bedienbarkeit bestimmen.
+func stateCategory(state string) string {
+	switch state {
+	case "CONNECTED":
+		return "connected"
+	case "GET_CONFIG", "ASSIGN_IP", "RECONNECTING", "AUTH", "WAIT", "TCP_CONNECT", "WAITING":
+		return "connecting"
+	default:
+		return "disconnected"
+	}
+}
+
+// friendlyState übersetzt die technischen OpenVPN-Statuscodes in
+// verständliche deutsche Meldungen für die Statusanzeige.
+func friendlyState(state string) string {
+	switch state {
+	case "CONNECTED":
+		return "Verbunden"
+	case "DISCONNECTED":
+		return "Getrennt"
+	case "AUTH":
+		return "Authentifiziere..."
+	case "GET_CONFIG":
+		return "Lade Konfiguration..."
+	case "ASSIGN_IP":
+		return "Weise IP-Adresse zu..."
+	case "TCP_CONNECT":
+		return "Verbinde zum Server..."
+	case "WAIT", "WAITING":
+		return "Warte auf Server..."
+	case "RECONNECTING":
+		return "Verbindung wird wiederhergestellt..."
+	default:
+		return state
+	}
+}
+
 func (ui *AppUI) startStatusLoop() {
 	lastState := "INIT"
 	lastIP := "INIT"
@@ -312,32 +361,36 @@ func (ui *AppUI) startStatusLoop() {
 		status := getStatus()
 
 		if status.State != lastState || status.LocalIP != lastIP {
-			_ = ui.statusData.Set("Status: " + status.State)
+			category := stateCategory(status.State)
+
+			_ = ui.statusData.Set("Status: " + friendlyState(status.State))
 			if status.LocalIP != "" {
 				_ = ui.ipData.Set("IP: " + status.LocalIP)
 			} else {
 				_ = ui.ipData.Set("")
 			}
 
-			if ui.trayApp != nil {
-				if status.State == "CONNECTED" && lastState != "CONNECTED" {
-					_ = ui.connectedBinding.Set(true)
-				} else if status.State != "CONNECTED" {
-					_ = ui.connectedBinding.Set(false)
-				}
-
-				switch status.State {
-				case "CONNECTED":
-					fyne.Do(func() { ui.setUIState(true) })
-					ui.trayApp.SetSystemTrayIcon(ui.iconGreen)
-				case "GET_CONFIG", "ASSIGN_IP", "RECONNECTING", "AUTH", "WAIT", "TCP_CONNECT", "WAITING":
-					fyne.Do(func() { ui.setUIState(true) })
-					ui.trayApp.SetSystemTrayIcon(ui.iconYellow)
-				default:
-					fyne.Do(func() { ui.setUIState(false) })
-					ui.trayApp.SetSystemTrayIcon(ui.iconRed)
-				}
+			if status.State == "CONNECTED" && lastState != "CONNECTED" {
+				_ = ui.connectedBinding.Set(true)
+			} else if status.State != "CONNECTED" {
+				_ = ui.connectedBinding.Set(false)
 			}
+
+			trayIcon := ui.iconRed
+			switch category {
+			case "connected":
+				trayIcon = ui.iconGreen
+			case "connecting":
+				trayIcon = ui.iconYellow
+			}
+
+			fyne.Do(func() {
+				ui.setUIState(category != "disconnected")
+			})
+			if ui.trayApp != nil {
+				ui.trayApp.SetSystemTrayIcon(trayIcon)
+			}
+
 			lastState = status.State
 			lastIP = status.LocalIP
 		}
@@ -346,7 +399,7 @@ func (ui *AppUI) startStatusLoop() {
 }
 
 func (ui *AppUI) refreshConfigList() {
-	respData, err := sendCommand(Request{Action: "list"})
+	respData, err := sendCommand(ipc.Request{Action: "list"})
 	if err != nil {
 		log.Printf("Fehler beim Abrufen der Config-Liste: %v", err)
 		return
@@ -358,9 +411,19 @@ func (ui *AppUI) refreshConfigList() {
 		return
 	}
 
+	lastConfig := ui.prefs.String("lastConfig")
+
 	fyne.Do(func() {
 		ui.configSelect.Options = configs
 		ui.configSelect.Refresh()
+
+		for _, c := range configs {
+			if c == lastConfig {
+				ui.configSelect.SetSelected(lastConfig)
+				ui.selectedConfig = lastConfig
+				break
+			}
+		}
 	})
 }
 
@@ -378,7 +441,6 @@ func (ui *AppUI) setUIState(connected bool) {
 	} else {
 		ui.startBtn.Enable()
 		ui.stopBtn.Disable()
-		ui.userEntry.SetText("")
 		ui.userEntry.Enable()
 		ui.passEntry.Enable()
 		ui.configSelect.Enable()
@@ -402,8 +464,8 @@ func (ui *AppUI) showError(err error) {
 // IPC CLIENT (UNIX SOCKET)
 // -----------------------------------------------------------------------------
 
-func sendCommand(req Request) (json.RawMessage, error) {
-	conn, err := net.DialTimeout("unix", SocketPath, 3*time.Second)
+func sendCommand(req ipc.Request) (json.RawMessage, error) {
+	conn, err := net.DialTimeout("unix", ipc.SocketPath, 3*time.Second)
 	if err != nil {
 		return nil, errors.New("daemon nicht erreichbar")
 	}
@@ -414,7 +476,7 @@ func sendCommand(req Request) (json.RawMessage, error) {
 		return nil, err
 	}
 
-	var resp DaemonResponse
+	var resp ipc.Response
 	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
 		return nil, errors.New("fehler beim Lesen der Server-Antwort")
 	}
@@ -426,15 +488,15 @@ func sendCommand(req Request) (json.RawMessage, error) {
 	return resp.Data, nil
 }
 
-func getStatus() VPNStatus {
-	data, err := sendCommand(Request{Action: "status"})
+func getStatus() ipc.VPNStatus {
+	data, err := sendCommand(ipc.Request{Action: "status"})
 	if err != nil {
-		return VPNStatus{State: err.Error()}
+		return ipc.VPNStatus{State: err.Error()}
 	}
 
-	var status VPNStatus
+	var status ipc.VPNStatus
 	if err := json.Unmarshal(data, &status); err != nil {
-		return VPNStatus{State: "Fehler beim Parsen"}
+		return ipc.VPNStatus{State: "Fehler beim Parsen"}
 	}
 	return status
 }

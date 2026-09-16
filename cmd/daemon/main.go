@@ -20,10 +20,11 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"openvpnGUI/internal/ipc"
 )
 
 const (
-	SocketPath    = "/run/vpn-manager.sock"
 	MgmtSocket    = "/run/vpn-openvpn-mgmt.sock"
 	ConfigDir     = "/etc/vpn-manager/configs"
 	SecureTempDir = "/run/vpn-manager-temp"
@@ -36,25 +37,6 @@ type VPNManager struct {
 	done chan struct{}
 }
 
-type Request struct {
-	Action   string `json:"action"`
-	Config   string `json:"config"`
-	Username string `json:"username"`
-	Password string `json:"password"`
-	Content  string `json:"content"`
-}
-
-type DaemonResponse struct {
-	Status  string `json:"status"`
-	Message string `json:"message"`
-	Data    any    `json:"data,omitempty"`
-}
-
-type VPNStatus struct {
-	State   string `json:"state"`
-	LocalIP string `json:"local_ip"`
-}
-
 func main() {
 	cleanupSockets()
 
@@ -65,7 +47,7 @@ func main() {
 		}
 	}
 
-	listener, err := net.Listen("unix", SocketPath)
+	listener, err := net.Listen("unix", ipc.SocketPath)
 	if err != nil {
 		log.Fatalf("Socket konnte nicht erstellt werden: %v", err)
 	}
@@ -107,7 +89,7 @@ func main() {
 // OPENVPN PROZESS & PUSH_REPLY STREAM PARSER
 // -----------------------------------------------------------------------------
 
-func (m *VPNManager) startVPN(req Request) error {
+func (m *VPNManager) startVPN(req ipc.Request) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -152,7 +134,7 @@ func (m *VPNManager) startVPN(req Request) error {
 	}
 
 	cmd := exec.Command("/usr/sbin/openvpn", args...)
-	
+
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		if authFile != "" {
@@ -172,29 +154,29 @@ func (m *VPNManager) startVPN(req Request) error {
 	m.cmd = cmd
 	m.done = make(chan struct{})
 
-// Überwachungs- & Log-Parsing Goroutine
-go func(c *exec.Cmd, aFile string, doneChan chan struct{}) {
-    scanner := bufio.NewScanner(stdout)
-    for scanner.Scan() {
-        line := scanner.Text()
+	// Überwachungs- & Log-Parsing Goroutine
+	go func(c *exec.Cmd, aFile string, doneChan chan struct{}) {
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			line := scanner.Text()
 
-        // Routine-Management-Meldungen (Statusabfragen) ignorieren
-        if strings.Contains(line, "MANAGEMENT:") {
-            continue
-        }
+			// Routine-Management-Meldungen (Statusabfragen) ignorieren
+			if strings.Contains(line, "MANAGEMENT:") {
+				continue
+			}
 
-        // Alle verbleibenden OpenVPN-Logzeilen weiterleiten
-        log.Printf("[OpenVPN] %s", line)
+			// Alle verbleibenden OpenVPN-Logzeilen weiterleiten
+			log.Printf("[OpenVPN] %s", line)
 
-        // Parse den vom OpenVPN-Server gelieferten PUSH_REPLY
-        if strings.Contains(line, "PUSH_REPLY") {
-            dnsServers, domains := parsePushReply(line)
-            if len(dnsServers) > 0 {
-                log.Printf("Empfangene DNS-Server: %v, Domains: %v", dnsServers, domains)
-                applyDNS(InterfaceName, dnsServers, domains)
-            }
-        }
-    }
+			// Parse den vom OpenVPN-Server gelieferten PUSH_REPLY
+			if strings.Contains(line, "PUSH_REPLY") {
+				dnsServers, domains := parsePushReply(line)
+				if len(dnsServers) > 0 {
+					log.Printf("Empfangene DNS-Server: %v, Domains: %v", dnsServers, domains)
+					applyDNS(InterfaceName, dnsServers, domains)
+				}
+			}
+		}
 
 		_ = c.Wait()
 
@@ -360,7 +342,7 @@ func (m *VPNManager) handleConnection(conn net.Conn) {
 	defer conn.Close()
 	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 
-	var req Request
+	var req ipc.Request
 	if err := json.NewDecoder(conn).Decode(&req); err != nil {
 		sendResponse(conn, fmt.Errorf("ungültiger Request: %w", err), "", nil)
 		return
@@ -396,10 +378,10 @@ func (m *VPNManager) handleConnection(conn net.Conn) {
 	}
 }
 
-func (m *VPNManager) getVPNStatus() (VPNStatus, error) {
+func (m *VPNManager) getVPNStatus() (ipc.VPNStatus, error) {
 	conn, err := net.DialTimeout("unix", MgmtSocket, 1*time.Second)
 	if err != nil {
-		return VPNStatus{State: "DISCONNECTED"}, nil
+		return ipc.VPNStatus{State: "DISCONNECTED"}, nil
 	}
 	defer conn.Close()
 
@@ -414,7 +396,7 @@ func (m *VPNManager) getVPNStatus() (VPNStatus, error) {
 	}
 
 	if _, err := fmt.Fprintf(conn, "state\n"); err != nil {
-		return VPNStatus{State: "UNKNOWN"}, err
+		return ipc.VPNStatus{State: "UNKNOWN"}, err
 	}
 
 	for scanner.Scan() {
@@ -426,7 +408,7 @@ func (m *VPNManager) getVPNStatus() (VPNStatus, error) {
 
 		parts := strings.Split(line, ",")
 		if len(parts) >= 2 {
-			status := VPNStatus{
+			status := ipc.VPNStatus{
 				State: strings.TrimSpace(parts[1]),
 			}
 
@@ -438,10 +420,10 @@ func (m *VPNManager) getVPNStatus() (VPNStatus, error) {
 		}
 	}
 
-	return VPNStatus{State: "WAITING"}, nil
+	return ipc.VPNStatus{State: "WAITING"}, nil
 }
 
-func handleImport(req Request) error {
+func handleImport(req ipc.Request) error {
 	configPath, err := resolveConfigPath(req.Config)
 	if err != nil {
 		return err
@@ -475,7 +457,7 @@ func handleList() ([]string, error) {
 	return configFiles, nil
 }
 
-func handleDelete(req Request) error {
+func handleDelete(req ipc.Request) error {
 	configPath, err := resolveConfigPath(req.Config)
 	if err != nil {
 		return err
@@ -494,15 +476,19 @@ func handleDelete(req Request) error {
 }
 
 func sendResponse(conn net.Conn, err error, successMsg string, data any) {
-	resp := DaemonResponse{
-		Status:  "success",
-		Message: successMsg,
-		Data:    data,
-	}
+	resp := ipc.Response{Status: "success", Message: successMsg}
+
 	if err != nil {
 		resp.Status = "error"
 		resp.Message = err.Error()
-		resp.Data = nil
+	} else if data != nil {
+		raw, marshalErr := json.Marshal(data)
+		if marshalErr != nil {
+			resp.Status = "error"
+			resp.Message = marshalErr.Error()
+		} else {
+			resp.Data = raw
+		}
 	}
 	_ = json.NewEncoder(conn).Encode(resp)
 }
@@ -526,18 +512,18 @@ func sanitizeFileName(filename string) string {
 }
 
 func cleanupSockets() {
-	_ = os.Remove(SocketPath)
+	_ = os.Remove(ipc.SocketPath)
 	_ = os.Remove(MgmtSocket)
 }
 
 func setupSocketPermissions() {
-	if err := os.Chmod(SocketPath, 0660); err != nil {
+	if err := os.Chmod(ipc.SocketPath, 0660); err != nil {
 		log.Printf("Warnung: Socket Chmod fehlgeschlagen: %v", err)
 	}
 
 	if g, err := user.LookupGroup("vpnusers"); err == nil {
 		if gid, err := strconv.Atoi(g.Gid); err == nil {
-			if err := os.Chown(SocketPath, -1, gid); err != nil {
+			if err := os.Chown(ipc.SocketPath, -1, gid); err != nil {
 				log.Printf("Warnung: Socket Chown auf vpnusers fehlgeschlagen: %v", err)
 			}
 		}
