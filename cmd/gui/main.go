@@ -41,18 +41,15 @@ type AppUI struct {
 	userEntry        *widget.Entry
 	passEntry        *widget.Entry
 	configSelect     *widget.Select
-	statusIcon       *widget.Icon
 	statusData       binding.String
 	ipData           binding.String
 	connectedBinding binding.Bool
 	selectedConfig   string
 
-	iconRed       fyne.Resource
-	iconYellow    fyne.Resource
-	iconGreen     fyne.Resource
-	iconRedBig    fyne.Resource
-	iconYellowBig fyne.Resource
-	iconGreenBig  fyne.Resource
+	iconRed    fyne.Resource
+	iconYellow fyne.Resource
+	iconGreen  fyne.Resource
+	iconAppBig fyne.Resource
 }
 
 func main() {
@@ -90,12 +87,12 @@ func newAppUI() *AppUI {
 	ui.iconRed = ui.loadIcon("red")
 	ui.iconYellow = ui.loadIcon("yellow")
 	ui.iconGreen = ui.loadIcon("green")
-	ui.iconRedBig = ui.loadIcon("red64")
-	ui.iconYellowBig = ui.loadIcon("yellow64")
-	ui.iconGreenBig = ui.loadIcon("green64")
+	ui.iconAppBig = ui.loadIcon("red64")
 
-	myApp.SetIcon(ui.iconRedBig)
-	win.SetIcon(ui.iconRedBig)
+	// App-/Fenster-Icon bleibt statisch; der Verbindungsstatus wird
+	// ausschließlich über das Tray-Icon signalisiert.
+	myApp.SetIcon(ui.iconAppBig)
+	win.SetIcon(ui.iconAppBig)
 
 	return ui
 }
@@ -113,7 +110,6 @@ func (ui *AppUI) loadIcon(name string) fyne.Resource {
 func (ui *AppUI) buildUI() {
 	_ = ui.statusData.Set("Status: Bereit")
 
-	ui.statusIcon = widget.NewIcon(ui.iconRed)
 	statusLabel := widget.NewLabelWithData(ui.statusData)
 	ipLabel := widget.NewLabelWithData(ui.ipData)
 
@@ -162,7 +158,7 @@ func (ui *AppUI) buildUI() {
 	spacer := layout.NewSpacer()
 	importBtns := container.NewHBox(importBtn, spacer, deleteBtn)
 	startBtns := container.NewHBox(ui.startBtn, spacer, ui.stopBtn)
-	statusRow := container.NewHBox(ui.statusIcon, statusLabel, layout.NewSpacer(), ipLabel)
+	statusRow := container.NewHBox(statusLabel, layout.NewSpacer(), ipLabel)
 
 	// Anordnung optimiert für die TAB-Fokus-Reihenfolge (Top-Down)
 	content := container.NewVBox(
@@ -271,7 +267,9 @@ func (ui *AppUI) handleStart() {
 	// auf die Antwort des Daemons gewartet wird.
 	ui.startBtn.Disable()
 	_ = ui.statusData.Set("Status: Verbinde...")
-	ui.statusIcon.SetResource(ui.iconYellow)
+	if ui.trayApp != nil {
+		ui.trayApp.SetSystemTrayIcon(ui.iconYellow)
+	}
 
 	go func() {
 		if _, err := sendCommand(req); err != nil {
@@ -378,21 +376,19 @@ func (ui *AppUI) startStatusLoop() {
 				_ = ui.connectedBinding.Set(false)
 			}
 
-			smallIcon, bigIcon := ui.iconRed, ui.iconRedBig
+			trayIcon := ui.iconRed
 			switch category {
 			case "connected":
-				smallIcon, bigIcon = ui.iconGreen, ui.iconGreenBig
+				trayIcon = ui.iconGreen
 			case "connecting":
-				smallIcon, bigIcon = ui.iconYellow, ui.iconYellowBig
+				trayIcon = ui.iconYellow
 			}
 
 			fyne.Do(func() {
 				ui.setUIState(category != "disconnected")
-				ui.statusIcon.SetResource(smallIcon)
-				ui.window.SetIcon(bigIcon)
 			})
 			if ui.trayApp != nil {
-				ui.trayApp.SetSystemTrayIcon(smallIcon)
+				ui.trayApp.SetSystemTrayIcon(trayIcon)
 			}
 
 			lastState = status.State
