@@ -16,10 +16,10 @@ Rechten des angemeldeten Benutzers.
 ## Architektur
 
 ```
-┌─────────────┐   Unix-Socket    ┌──────────────┐
-│  cmd/gui     │ ───────────────▶│  cmd/daemon  │──▶ openvpn (root)
+┌──────────────┐   Unix-Socket    ┌──────────────┐
+│  cmd/gui     │ ───────────────▶ │  cmd/daemon  │──▶ openvpn (root)
 │ (User-Rechte)│  /run/vpn-       │ (root)       │──▶ resolvectl/DNS
-└─────────────┘  manager.sock    └──────────────┘
+└──────────────┘  manager.sock    └──────────────┘
 ```
 
 Das gemeinsame Nachrichtenformat (`Request`/`Response`/`VPNStatus`) liegt in
