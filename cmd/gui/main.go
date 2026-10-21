@@ -177,6 +177,18 @@ func (ui *AppUI) buildUI() {
 // -----------------------------------------------------------------------------
 
 func (ui *AppUI) handleImport() {
+	// Erst prüfen, ob der Daemon läuft, damit der Nutzer nicht vergeblich
+	// eine Datei auswählt, die anschließend nicht importiert werden kann.
+	go func() {
+		if _, err := sendCommand(ipc.Request{Action: "list"}); err != nil {
+			ui.showError(fmt.Errorf("import nicht möglich: %w", err))
+			return
+		}
+		fyne.Do(ui.showImportDialog)
+	}()
+}
+
+func (ui *AppUI) showImportDialog() {
 	fileDialog := dialog.NewFileOpen(func(reader fyne.URIReadCloser, err error) {
 		if err != nil {
 			ui.showError(err)
@@ -212,9 +224,11 @@ func (ui *AppUI) handleImport() {
 		}()
 	}, ui.window)
 
-	fileDialog.Resize(fyne.NewSize(700, 500))
 	fileDialog.SetFilter(storage.NewExtensionFileFilter([]string{".ovpn"}))
 	fileDialog.Show()
+	// Resize erst nach Show(): Fyne legt das interne Dialogfenster erst in
+	// Show() an, ein Resize davor führt zu einer nil-Pointer-Panic.
+	fileDialog.Resize(fyne.NewSize(700, 500))
 }
 
 func (ui *AppUI) handleDelete() {
