@@ -54,7 +54,10 @@ type AppUI struct {
 
 func main() {
 	startMinimized := flag.Bool("minimized", false, "Startet die App direkt minimiert im System-Tray")
+	scale := flag.Float64("scale", 0, "Skalierung von Schrift und Fenster, z. B. 1.5 oder 2 (Standard: Einstellung des Desktops)")
 	flag.Parse()
+
+	configureScale(*scale)
 
 	ui := newAppUI()
 	ui.buildUI()
@@ -169,6 +172,9 @@ func (ui *AppUI) buildUI() {
 	)
 
 	ui.window.SetContent(container.NewPadded(content))
+	// Sinnvolle Startgröße; das Fenster bleibt frei vergrößerbar.
+	ui.window.SetFixedSize(false)
+	ui.window.Resize(fyne.NewSize(480, content.MinSize().Height+2*theme.Padding()))
 	ui.window.SetCloseIntercept(func() { ui.window.Hide() })
 }
 

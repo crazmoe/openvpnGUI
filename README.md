@@ -99,6 +99,16 @@ Optional minimiert im System-Tray starten (z. B. per Autostart-Eintrag):
 ./vpn-gui --minimized
 ```
 
+Die GUI übernimmt die Skalierung des Desktops (z. B. 150 % oder 200 % auf
+HiDPI-Bildschirmen) automatisch aus `Xft.dpi` bzw. `GDK_SCALE`. Passt die
+Grösse trotzdem nicht, lässt sie sich von Hand festlegen:
+
+```sh
+./vpn-gui --scale 2
+```
+
+Alternativ wirkt auch die Fyne-Umgebungsvariable `FYNE_SCALE`.
+
 ## Bedienung
 
 1. `.ovpn`-Konfiguration über **Importieren** hinzufügen.
