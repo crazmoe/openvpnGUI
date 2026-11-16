@@ -42,6 +42,27 @@ go build -o vpn-daemon ./cmd/daemon
 go build -o vpn-gui ./cmd/gui
 ```
 
+### Debian-Paket bauen
+
+Auf Debian/Ubuntu (und Abkömmlingen) baut `build.sh` beide Programme und
+packt sie zusammen mit systemd-Dienst, Startmenü-Eintrag und Icon in ein
+`.deb`:
+
+```sh
+./build.sh                    # Version aus dem git-Tag bzw. Ordnernamen
+./build.sh --version 1.0.15   # Version explizit setzen
+sudo apt install ./dist/openvpngui_*.deb
+sudo usermod -aG vpnusers "$USER"   # danach neu anmelden
+```
+
+Fehlen Build-Abhängigkeiten, nennt das Skript den passenden
+`sudo apt install …`-Befehl. Das Paket legt die Gruppe `vpnusers` an und
+aktiviert den Dienst `vpn-manager.service` (Daemon unter
+`/usr/sbin/vpn-daemon`); die manuelle Einrichtung unten entfällt damit.
+Wer vorher schon manuell installiert hat, sollte
+`/etc/systemd/system/vpn-manager.service` und `/usr/local/bin/vpn-daemon`
+entfernen, sonst startet weiterhin die alte Version.
+
 ## Einrichtung
 
 ### 1. Daemon
